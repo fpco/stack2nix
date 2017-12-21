@@ -100,16 +100,8 @@ stack2nix args@Args{..} = do
 toNix :: Args -> Maybe String -> FilePath -> LoadConfig -> IO ()
 toNix args@Args{..} remoteUri baseDir lc = do
   bc <- lcLoadBuildConfig lc Nothing -- compiler
-  withSystemTempDirectory "s2n" $ \outDir -> do
-    let packages = filter (\p -> case p of
-                                   PLIndex _          -> False
-                                   PLOther (PLRepo _) -> True
-                                   _ -> error $ "Unsupported build config dependency: " ++ show p) (bcDependencies bc)
-    runPlan baseDir outDir remoteUri (map toPackageRef packages) lc args $ patchAndMerge args baseDir bc outDir
-  where
-    toPackageRef :: PackageLocationIndex Subdirs -> PackageRef
-    toPackageRef (PLOther (PLRepo repo)) = RepoPackage repo
-    toPackageRef p = error $ "Unsupported package location index: " ++ show p
+  withSystemTempDirectory "s2n" $ \outDir ->
+    runPlan baseDir outDir remoteUri lc args $ patchAndMerge args baseDir bc outDir
 
 patchAndMerge :: Args -> FilePath -> BuildConfig -> FilePath -> IO ()
 patchAndMerge Args{..} baseDir BuildConfig{..} outDir = do

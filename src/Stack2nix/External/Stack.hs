@@ -5,43 +5,35 @@ module Stack2nix.External.Stack
   ( PackageRef(..), runPlan
   ) where
 
-import           Control.Applicative           ((<|>))
 import           Control.Monad                 (unless)
-import           Control.Monad.Reader          (local)
-import           Data.List                     (isInfixOf, nubBy, sortBy)
+import           Data.List                     (isInfixOf)
 import qualified Data.Map.Strict               as M
 import           Data.Maybe                    (fromJust)
 import qualified Data.Set                      as S
 import           Data.Text                     (pack, unpack)
-import           Lens.Micro                    (set)
 import           Options.Applicative
-import           Stack.Build                   (mkBaseConfigOpts,
-                                                withLoadPackage)
-import           Stack.Build.ConstructPlan     (constructPlan)
-import           Stack.Build.Haddock           (shouldHaddockDeps)
-import           Stack.Build.Installed         (GetInstalledOpts (..),
-                                                getInstalled)
 import           Stack.Build.Source            (loadSourceMapFull)
 import           Stack.Build.Target            (NeedTargets (..))
 import           Stack.Options.BuildParser
 import           Stack.Options.GlobalParser
 import           Stack.Options.Utils           (GlobalOptsContext (..))
-import           Stack.Prelude                 hiding (mapConcurrently)
+import           Stack.Prelude                 hiding (mapConcurrently, logDebug)
 import           Stack.Runners                 (withBuildConfig)
-import           Stack.Types.Build             (Plan (..), Task (..),
-                                                TaskConfigOpts (..),
-                                                TaskType (..), lpDir)
-import           Stack.Types.BuildPlan         (Repo (..), Subdirs (..))
+import           Stack.Types.BuildPlan         (Repo (..), PackageLocation (..))
 import           Stack.Types.Config
 import           Stack.Types.Config.Build      (BuildCommand (..))
 import           Stack.Types.Nix
+import           Stack.Types.Package           (PackageSource (..), lpPackage,
+                                                packageName,
+                                                packageVersion, lpLocation)
+import           Stack.Types.PackageName       (PackageName)
 import           Stack.Types.PackageIdentifier (PackageIdentifier (..),
                                                 packageIdentifierString,
-                                                parsePackageIdentifier)
+                                                PackageIdentifierRevision (..))
 import           Stack2nix.External.Cabal2nix  (cabal2nix)
 import           Stack2nix.External.Util       (failHard, runCmd)
 import           Stack2nix.Types               (Args (..))
-import           Stack2nix.Util                (mapPool)
+import           Stack2nix.Util                (mapPool, logDebug)
 import           System.Directory              (canonicalizePath,
                                                 createDirectoryIfMissing,
                                                 getCurrentDirectory,
@@ -51,119 +43,73 @@ import           System.IO                     (hPutStrLn, stderr)
 import qualified Distribution.Nixpkgs.Haskell.Hackage as DB
 import Distribution.Nixpkgs.Haskell.PackageSourceSpec (loadHackageDB)
 
-data PackageRef = LocalPackage PackageIdentifier FilePath (Maybe Text)
-                | CabalPackage PackageIdentifier
-                | RepoPackage (Repo Subdirs)
-                deriving (Eq, Show)
+data PackageRef
+  = HackagePackage PackageIdentifierRevision
+  | NonHackagePackage PackageIdentifier (PackageLocation FilePath)
+  deriving (Eq, Show)
 
 genNixFile :: Args -> FilePath -> FilePath -> Maybe String -> Maybe String -> DB.HackageDB -> PackageRef -> IO ()
 genNixFile args baseDir outDir uri argRev hackageDB pkgRef = do
   cwd <- getCurrentDirectory
-  -- hPutStrLn stderr $ "\nGenerating nix expression for " ++ show pkgRef
-  -- hPutStrLn stderr $ "genNixFile (cwd): " ++ cwd
-  -- hPutStrLn stderr $ "genNixFile (baseDir): " ++ baseDir
-  -- hPutStrLn stderr $ "genNixFile (outDir): " ++ outDir
-  -- hPutStrLn stderr $ "genNixFile (uri): " ++ show uri
-  -- hPutStrLn stderr $ "genNixFile (pkgRef): " ++ show pkgRef
+  logDebug args $ "\nGenerating nix expression for " ++ show pkgRef
+  logDebug args $ "genNixFile (cwd): " ++ cwd
+  logDebug args $ "genNixFile (baseDir): " ++ baseDir
+  logDebug args $ "genNixFile (outDir): " ++ outDir
+  logDebug args $ "genNixFile (uri): " ++ show uri
+  logDebug args $ "genNixFile (pkgRef): " ++ show pkgRef
   case pkgRef of
-    LocalPackage _ident path mrev -> do
-      relPath <- makeRelativeToCurrentDirectory path
-      -- hPutStrLn stderr $ "genNixFile (LocalPackage: relPath): " ++ relPath
-      projRoot <- canonicalizePath $ cwd </> baseDir
-      -- hPutStrLn stderr $ "genNixFile (LocalPackage: projRoot): " ++ projRoot
-      let defDir = baseDir </> makeRelative projRoot path
-      -- hPutStrLn stderr $ "genNixFile (LocalPackage: defDir): " ++ defDir
-      unless (".s2n" `isInfixOf` path) $
-        void $ cabal2nix args(fromMaybe defDir uri) (mrev <|> (pack <$> argRev)) (const relPath <$> uri) (Just outDir) hackageDB
-    CabalPackage pkg ->
+    HackagePackage (PackageIdentifierRevision pkg revision) -> -- FIXME use revision
       void $ cabal2nix args ("cabal://" <> packageIdentifierString pkg) Nothing Nothing (Just outDir) hackageDB
-    RepoPackage repo ->
-      case repoSubdirs repo of
-        ExplicitSubdirs sds ->
-          mapM_ (\sd -> cabal2nix args (unpack $ repoUrl repo) (Just $ repoCommit repo) (Just sd) (Just outDir) hackageDB) sds
-        DefaultSubdirs ->
-          void $ cabal2nix args (unpack $ repoUrl repo) (Just $ repoCommit repo) Nothing (Just outDir) hackageDB
+    NonHackagePackage _ident (PLFilePath path) -> do
+      relPath <- makeRelativeToCurrentDirectory path
+      logDebug args $ "genNixFile (LocalPackage: relPath): " ++ relPath
+      projRoot <- canonicalizePath $ cwd </> baseDir
+      logDebug args $ "genNixFile (LocalPackage: projRoot): " ++ projRoot
+      let defDir = baseDir </> makeRelative projRoot path
+      logDebug args $ "genNixFile (LocalPackage: defDir): " ++ defDir
+      unless (".s2n" `isInfixOf` path) $
+        void $ cabal2nix args(fromMaybe defDir uri) (pack <$> argRev) (const relPath <$> uri) (Just outDir) hackageDB
+    NonHackagePackage _ident (PLRepo repo) ->
+       cabal2nix args (unpack $ repoUrl repo) (Just $ repoCommit repo) (Just (repoSubdirs repo)) (Just outDir) hackageDB
+    NonHackagePackage _ident PLArchive {} -> error "genNixFile: No support for archive package locations"
 
-planToPackages :: Plan -> [PackageRef]
-planToPackages plan = concatMap taskToPackages $ M.elems $ planTasks plan
+sourceMapToPackages :: Map PackageName PackageSource -> [PackageRef]
+sourceMapToPackages = map sourceToPackage . M.elems
   where
-    taskToPackages :: Task -> [PackageRef]
-    taskToPackages task =
-      let provided = case taskType task of
-                       TTFiles lp _il -> LocalPackage (taskProvides task) (toFilePath $ lpDir lp) Nothing
-                       TTIndex{} -> CabalPackage (taskProvides task) in
-      provided : (CabalPackage <$> (S.toList . tcoMissing $ taskConfigOpts task))
-
-packageIdentifier :: PackageRef -> Maybe PackageIdentifier
-packageIdentifier (LocalPackage pid _ _) = Just pid
-packageIdentifier (CabalPackage pid)     = Just pid
-packageIdentifier (RepoPackage _)        = Nothing
-
-prioritize :: [PackageRef] -> [PackageRef]
-prioritize = reverse .
-             -- TODO: filter out every CabalPackage which is already
-             -- covered by a RepoPackage; then reversing shouldn't be
-             -- needed.
-             nubBy (\p1 p2 -> let n1 = packageIdentifier p1
-                                  n2 = packageIdentifier p2 in
-                                not (isNothing n1 || isNothing n2) && n1 == n2) .
-             sortBy (\p1 p2 ->
-                       case (p1, p2) of
-                         (LocalPackage pid1 _ _, LocalPackage pid2 _ _) -> compare (show pid1) (show pid2)
-                         (LocalPackage{}, _) -> LT
-                         (_, LocalPackage{}) -> GT
-                         _ ->
-                           let name p = maybe "" show (packageIdentifier p) in
-                             compare (name p1) (name p2))
+    sourceToPackage :: PackageSource -> PackageRef
+    sourceToPackage (PSIndex _ _flags _options pir) = HackagePackage pir
+    sourceToPackage (PSFiles lp _) =
+      let pkg = lpPackage lp
+          ident = PackageIdentifier (packageName pkg) (packageVersion pkg)
+       in NonHackagePackage ident (lpLocation lp)
 
 planAndGenerate :: HasEnvConfig env
                 => BuildOptsCLI
                 -> FilePath
                 -> FilePath
                 -> Maybe String
-                -> [PackageRef]
                 -> Args
                 -> IO ()
                 -> RIO env ()
-planAndGenerate boptsCli baseDir outDir remoteUri revPkgs args@Args{..} doAfter = do
-  local (set platformL argPlatform) $ do
-    bopts <- view buildOptsL
-    let profiling = boptsLibProfile bopts || boptsExeProfile bopts
-    let symbols = not (boptsLibStrip bopts || boptsExeStrip bopts)
-    menv <- getMinimalEnvOverride
+planAndGenerate boptsCli baseDir outDir remoteUri args@Args{..} doAfter = do
+    (_targets, _mbp, _locals, _extraToBuild, sourceMap) <- loadSourceMapFull NeedTargets boptsCli
 
-    (_targets, mbp, locals, extraToBuild, sourceMap) <- loadSourceMapFull NeedTargets boptsCli
-    _stackYaml <- view stackYamlL
-
-    (installedMap, _globalDumpPkgs, _snapshotDumpPkgs, localDumpPkgs) <-
-      getInstalled menv
-                   GetInstalledOpts
-                     { getInstalledProfiling = profiling
-                     , getInstalledHaddock   = shouldHaddockDeps bopts
-                     , getInstalledSymbols   = symbols }
-                   sourceMap
-
-    baseConfigOpts <- mkBaseConfigOpts boptsCli
-    plan <- withLoadPackage $ \loadPackage ->
-      constructPlan mbp baseConfigOpts locals extraToBuild localDumpPkgs loadPackage sourceMap installedMap (boptsCLIInitialBuildSteps boptsCli)
-    -- hscolour is needed until https://github.com/NixOS/nixpkgs/issues/32609 is addressed
-    hscolour <-parsePackageIdentifier "hscolour-1.24.4"
-    let pkgs = prioritize $ planToPackages plan ++ revPkgs ++ [CabalPackage hscolour]
+    let pkgs = sourceMapToPackages sourceMap
     liftIO $ hPutStrLn stderr $ "plan:\n" ++ show pkgs
 
     hackageDB <- liftIO $ loadHackageDB Nothing argHackageSnapshot
+    void $ liftIO $ mapM_ (\pkg -> cabal2nix args ("cabal://" ++ pkg) Nothing Nothing (Just outDir) hackageDB) $ words "hscolour stringbuilder"
     void $ liftIO $ mapPool argThreads (genNixFile args baseDir outDir remoteUri argRev hackageDB) pkgs
     liftIO doAfter
 
 runPlan :: FilePath
         -> FilePath
         -> Maybe String
-        -> [PackageRef]
         -> LoadConfig
         -> Args
         -> IO ()
         -> IO ()
-runPlan baseDir outDir remoteUri revPkgs lc args@Args{..} doAfter = do
+runPlan baseDir outDir remoteUri lc args@Args{..} doAfter = do
   let pkgsInConfig = nixPackages (configNix $ lcConfig lc)
   let pkgs = map unpack pkgsInConfig ++ ["ghc", "git"]
   let stackRoot = "/tmp/s2n"
@@ -171,9 +117,9 @@ runPlan baseDir outDir remoteUri revPkgs lc args@Args{..} doAfter = do
   globals <- queryNixPkgsPaths Include pkgs >>= \includes ->
              queryNixPkgsPaths Lib pkgs >>= \libs ->
              pure $ globalOpts baseDir stackRoot includes libs args
-  -- hPutStrLn stderr $ "stack global opts:\n" ++ ppShow globals
-  -- hPutStrLn stderr $ "stack build opts:\n" ++ ppShow buildOpts
-  withBuildConfig globals $ planAndGenerate buildOpts baseDir outDir remoteUri revPkgs args doAfter
+  logDebug args $ "stack global opts:\n" ++ show globals
+  logDebug args $ "stack build opts:\n" ++ show buildOpts
+  withBuildConfig globals $ planAndGenerate buildOpts baseDir outDir remoteUri args doAfter
 
 {-
   TODO:
@@ -204,6 +150,9 @@ globalOpts currentDir stackRoot extraIncludes extraLibs Args{..} =
          (globalConfigMonoid go)
          { configMonoidExtraIncludeDirs = extraIncludes
          , configMonoidExtraLibDirs = extraLibs
+         , configMonoidNixOpts = mempty
+             { nixMonoidEnable = First (Just True)
+             }
          }
      , globalLogLevel = if argVerbose then LevelDebug else LevelInfo
      }
