@@ -5,10 +5,8 @@ module Stack2nix.External.Stack
   ( PackageRef(..), runPlan
   ) where
 
-import           Control.Applicative           ((<|>))
-import           Control.Monad                 (unless)
-import           Control.Monad.Trans.State     (execStateT)
-import           Data.List                     (isInfixOf, nubBy, sortBy)
+import           Data.Function                 (on)
+import           Data.List                     (nubBy, sortBy, isInfixOf)
 import qualified Data.Map.Strict               as M
 import           Data.Maybe                    (fromJust)
 import qualified Data.Set                      as S
@@ -22,13 +20,13 @@ import           Stack.Options.GlobalParser
 import           Stack.Options.Utils           (GlobalOptsContext (..))
 import           Stack.Prelude                 hiding (mapConcurrently, logDebug)
 import           Stack.Runners                 (withBuildConfig)
-import           Stack.Types.BuildPlan         (Repo (..), Subdirs (..))
+import           Stack.Types.BuildPlan         (Repo (..), PackageLocation (..))
 import           Stack.Types.Config
 import           Stack.Types.Config.Build      (BuildCommand (..))
 import           Stack.Types.Nix
 import           Stack.Types.Package           (PackageSource (..), lpPackage,
-                                                lpDir, packageName,
-                                                packageVersion)
+                                                packageName,
+                                                packageVersion, lpLocation)
 import           Stack.Types.PackageName       (PackageName)
 import           Stack.Types.PackageIdentifier (PackageIdentifier (..),
                                                 packageIdentifierString,
@@ -46,10 +44,10 @@ import           System.IO                     (hPutStrLn, stderr)
 import qualified Distribution.Nixpkgs.Haskell.Hackage as DB
 import Distribution.Nixpkgs.Haskell.PackageSourceSpec (loadHackageDB)
 
-data PackageRef = LocalPackage PackageIdentifier FilePath (Maybe Text)
-                | CabalPackage PackageIdentifier
-                | RepoPackage (Repo Subdirs)
-                deriving (Eq, Show)
+data PackageRef
+  = HackagePackage PackageIdentifierRevision
+  | NonHackagePackage PackageIdentifier (PackageLocation FilePath)
+  deriving (Eq, Show)
 
 genNixFile :: Args -> FilePath -> FilePath -> Maybe String -> Maybe String -> DB.HackageDB -> PackageRef -> IO ()
 genNixFile args baseDir outDir uri argRev hackageDB pkgRef = do
@@ -61,7 +59,9 @@ genNixFile args baseDir outDir uri argRev hackageDB pkgRef = do
   logDebug args $ "genNixFile (uri): " ++ show uri
   logDebug args $ "genNixFile (pkgRef): " ++ show pkgRef
   case pkgRef of
-    LocalPackage _ident path mrev -> do
+    HackagePackage (PackageIdentifierRevision pkg revision) -> -- FIXME use revision
+      void $ cabal2nix ("cabal://" <> packageIdentifierString pkg) Nothing Nothing (Just outDir) hackageDB
+    NonHackagePackage _ident (PLFilePath path) -> do
       relPath <- makeRelativeToCurrentDirectory path
       logDebug args $ "genNixFile (LocalPackage: relPath): " ++ relPath
       projRoot <- canonicalizePath $ cwd </> baseDir
@@ -69,47 +69,36 @@ genNixFile args baseDir outDir uri argRev hackageDB pkgRef = do
       let defDir = baseDir </> makeRelative projRoot path
       logDebug args $ "genNixFile (LocalPackage: defDir): " ++ defDir
       unless (".s2n" `isInfixOf` path) $
-        void $ cabal2nix (fromMaybe defDir uri) (mrev <|> (pack <$> argRev)) (const relPath <$> uri) (Just outDir) hackageDB
-    CabalPackage pkg ->
-      void $ cabal2nix ("cabal://" <> packageIdentifierString pkg) Nothing Nothing (Just outDir) hackageDB
-    RepoPackage repo ->
-      case repoSubdirs repo of
-        ExplicitSubdirs sds ->
-          mapM_ (\sd -> cabal2nix (unpack $ repoUrl repo) (Just $ repoCommit repo) (Just sd) (Just outDir) hackageDB) sds
-        DefaultSubdirs ->
-          void $ cabal2nix (unpack $ repoUrl repo) (Just $ repoCommit repo) Nothing (Just outDir) hackageDB
+        void $ cabal2nix (fromMaybe defDir uri) (pack <$> argRev) (const relPath <$> uri) (Just outDir) hackageDB
+    NonHackagePackage _ident (PLRepo repo) ->
+       cabal2nix (unpack $ repoUrl repo) (Just $ repoCommit repo) (Just (repoSubdirs repo)) (Just outDir) hackageDB
+    NonHackagePackage _ident PLArchive {} -> error "genNixFile: No support for archive package locations"
 
 sourceMapToPackages :: Map PackageName PackageSource -> [PackageRef]
 sourceMapToPackages = map sourceToPackage . M.elems
   where
     sourceToPackage :: PackageSource -> PackageRef
-    sourceToPackage (PSIndex _ _flags _options (PackageIdentifierRevision ident _rev)) = CabalPackage ident
+    sourceToPackage (PSIndex _ _flags _options pir) = HackagePackage pir
     sourceToPackage (PSFiles lp _) =
       let pkg = lpPackage lp
           ident = PackageIdentifier (packageName pkg) (packageVersion pkg)
-       in LocalPackage ident (toFilePath $ lpDir lp) Nothing
+       in NonHackagePackage ident (lpLocation lp)
 
-packageIdentifier :: PackageRef -> Maybe PackageIdentifier
-packageIdentifier (LocalPackage pid _ _) = Just pid
-packageIdentifier (CabalPackage pid)     = Just pid
-packageIdentifier (RepoPackage _)        = Nothing
+packageIdentifier :: PackageRef -> PackageIdentifier
+packageIdentifier (HackagePackage (PackageIdentifierRevision ident _)) = ident
+packageIdentifier (NonHackagePackage ident _) = ident
 
+-- FIXME MSS 2017-12-27 Unsure if this function is still performing
+-- its original function. What situation are we trying to protect
+-- against with the nubbing? Stack guarantees a unique package name
+-- per build plan.
 prioritize :: [PackageRef] -> [PackageRef]
 prioritize = reverse .
              -- TODO: filter out every CabalPackage which is already
              -- covered by a RepoPackage; then reversing shouldn't be
              -- needed.
-             nubBy (\p1 p2 -> let n1 = packageIdentifier p1
-                                  n2 = packageIdentifier p2 in
-                                not (isNothing n1 || isNothing n2) && n1 == n2) .
-             sortBy (\p1 p2 ->
-                       case (p1, p2) of
-                         (LocalPackage pid1 _ _, LocalPackage pid2 _ _) -> compare (show pid1) (show pid2)
-                         (LocalPackage{}, _) -> LT
-                         (_, LocalPackage{}) -> GT
-                         _ ->
-                           let name p = maybe "" show (packageIdentifier p) in
-                             compare (name p1) (name p2))
+             nubBy ((==) `on` packageIdentifier) .
+             sortBy (comparing packageIdentifier)
 
 planAndGenerate :: HasEnvConfig env
                 => Args
