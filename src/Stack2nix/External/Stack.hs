@@ -5,8 +5,7 @@ module Stack2nix.External.Stack
   ( PackageRef(..), runPlan
   ) where
 
-import           Data.Function                 (on)
-import           Data.List                     (nubBy, sortBy, isInfixOf)
+import           Data.List                     (isInfixOf)
 import qualified Data.Map.Strict               as M
 import           Data.Maybe                    (fromJust)
 import qualified Data.Set                      as S
@@ -84,38 +83,21 @@ sourceMapToPackages = map sourceToPackage . M.elems
           ident = PackageIdentifier (packageName pkg) (packageVersion pkg)
        in NonHackagePackage ident (lpLocation lp)
 
-packageIdentifier :: PackageRef -> PackageIdentifier
-packageIdentifier (HackagePackage (PackageIdentifierRevision ident _)) = ident
-packageIdentifier (NonHackagePackage ident _) = ident
-
--- FIXME MSS 2017-12-27 Unsure if this function is still performing
--- its original function. What situation are we trying to protect
--- against with the nubbing? Stack guarantees a unique package name
--- per build plan.
-prioritize :: [PackageRef] -> [PackageRef]
-prioritize = reverse .
-             -- TODO: filter out every CabalPackage which is already
-             -- covered by a RepoPackage; then reversing shouldn't be
-             -- needed.
-             nubBy ((==) `on` packageIdentifier) .
-             sortBy (comparing packageIdentifier)
-
 planAndGenerate :: HasEnvConfig env
                 => Args
                 -> BuildOptsCLI
                 -> FilePath
                 -> FilePath
                 -> Maybe String
-                -> [PackageRef]
                 -> Maybe String
                 -> Maybe UTCTime
                 -> Int
                 -> IO ()
                 -> RIO env ()
-planAndGenerate args boptsCli baseDir outDir remoteUri revPkgs argRev hSnapshot threads doAfter = do
+planAndGenerate args boptsCli baseDir outDir remoteUri argRev hSnapshot threads doAfter = do
   (_targets, _mbp, _locals, _extraToBuild, sourceMap) <- loadSourceMapFull NeedTargets boptsCli
 
-  let pkgs = prioritize $ sourceMapToPackages sourceMap ++ revPkgs
+  let pkgs = sourceMapToPackages sourceMap
   liftIO $ hPutStrLn stderr $ "plan:\n" ++ show pkgs
 
   hackageDB <- liftIO $ loadHackageDB Nothing hSnapshot
@@ -126,12 +108,11 @@ planAndGenerate args boptsCli baseDir outDir remoteUri revPkgs argRev hSnapshot 
 runPlan :: FilePath
         -> FilePath
         -> Maybe String
-        -> [PackageRef]
         -> LoadConfig
         -> Args
         -> IO ()
         -> IO ()
-runPlan baseDir outDir remoteUri revPkgs lc args@Args{..} doAfter = do
+runPlan baseDir outDir remoteUri lc args@Args{..} doAfter = do
   let pkgsInConfig = nixPackages (configNix $ lcConfig lc)
   let pkgs = map unpack pkgsInConfig ++ ["ghc", "git"]
   let stackRoot = "/tmp/s2n"
@@ -141,7 +122,7 @@ runPlan baseDir outDir remoteUri revPkgs lc args@Args{..} doAfter = do
              pure $ globalOpts baseDir stackRoot includes libs args
   logDebug args $ "stack global opts:\n" ++ show globals
   logDebug args $ "stack build opts:\n" ++ show buildOpts
-  withBuildConfig globals $ planAndGenerate args buildOpts baseDir outDir remoteUri revPkgs argRev argHackageSnapshot argThreads doAfter
+  withBuildConfig globals $ planAndGenerate args buildOpts baseDir outDir remoteUri argRev argHackageSnapshot argThreads doAfter
 
 {-
   TODO:
