@@ -7,6 +7,7 @@ module Stack2nix.External.Stack
 
 import           Control.Applicative           ((<|>))
 import           Control.Monad                 (unless)
+import           Control.Monad.Trans.State     (execStateT)
 import           Data.List                     (isInfixOf, nubBy, sortBy)
 import qualified Data.Map.Strict               as M
 import           Data.Maybe                    (fromJust)
@@ -14,12 +15,6 @@ import qualified Data.Set                      as S
 import           Data.Text                     (pack, unpack)
 import           Data.Time                     (UTCTime)
 import           Options.Applicative
-import           Stack.Build                   (mkBaseConfigOpts,
-                                                withLoadPackage)
-import           Stack.Build.ConstructPlan     (constructPlan)
-import           Stack.Build.Haddock           (shouldHaddockDeps)
-import           Stack.Build.Installed         (GetInstalledOpts (..),
-                                                getInstalled)
 import           Stack.Build.Source            (loadSourceMapFull)
 import           Stack.Build.Target            (NeedTargets (..))
 import           Stack.Options.BuildParser
@@ -27,15 +22,17 @@ import           Stack.Options.GlobalParser
 import           Stack.Options.Utils           (GlobalOptsContext (..))
 import           Stack.Prelude                 hiding (mapConcurrently, logDebug)
 import           Stack.Runners                 (withBuildConfig)
-import           Stack.Types.Build             (Plan (..), Task (..),
-                                                TaskConfigOpts (..),
-                                                TaskType (..), lpDir)
 import           Stack.Types.BuildPlan         (Repo (..), Subdirs (..))
 import           Stack.Types.Config
 import           Stack.Types.Config.Build      (BuildCommand (..))
 import           Stack.Types.Nix
+import           Stack.Types.Package           (PackageSource (..), lpPackage,
+                                                lpDir, packageName,
+                                                packageVersion)
+import           Stack.Types.PackageName       (PackageName)
 import           Stack.Types.PackageIdentifier (PackageIdentifier (..),
-                                                packageIdentifierString)
+                                                packageIdentifierString,
+                                                PackageIdentifierRevision (..))
 import           Stack2nix.External.Cabal2nix  (cabal2nix)
 import           Stack2nix.External.Util       (failHard, runCmd)
 import           Stack2nix.Types               (Args (..))
@@ -82,15 +79,15 @@ genNixFile args baseDir outDir uri argRev hackageDB pkgRef = do
         DefaultSubdirs ->
           void $ cabal2nix (unpack $ repoUrl repo) (Just $ repoCommit repo) Nothing (Just outDir) hackageDB
 
-planToPackages :: Plan -> [PackageRef]
-planToPackages plan = concatMap taskToPackages $ M.elems $ planTasks plan
+sourceMapToPackages :: Map PackageName PackageSource -> [PackageRef]
+sourceMapToPackages = map sourceToPackage . M.elems
   where
-    taskToPackages :: Task -> [PackageRef]
-    taskToPackages task =
-      let provided = case taskType task of
-                       TTFiles lp _il -> LocalPackage (taskProvides task) (toFilePath $ lpDir lp) Nothing
-                       TTIndex{} -> CabalPackage (taskProvides task) in
-      provided : (CabalPackage <$> (S.toList . tcoMissing $ taskConfigOpts task))
+    sourceToPackage :: PackageSource -> PackageRef
+    sourceToPackage (PSIndex _ _flags _options (PackageIdentifierRevision ident _rev)) = CabalPackage ident
+    sourceToPackage (PSFiles lp _) =
+      let pkg = lpPackage lp
+          ident = PackageIdentifier (packageName pkg) (packageVersion pkg)
+       in LocalPackage ident (toFilePath $ lpDir lp) Nothing
 
 packageIdentifier :: PackageRef -> Maybe PackageIdentifier
 packageIdentifier (LocalPackage pid _ _) = Just pid
@@ -127,26 +124,9 @@ planAndGenerate :: HasEnvConfig env
                 -> IO ()
                 -> RIO env ()
 planAndGenerate args boptsCli baseDir outDir remoteUri revPkgs argRev hSnapshot threads doAfter = do
-  bopts <- view buildOptsL
-  let profiling = boptsLibProfile bopts || boptsExeProfile bopts
-  let symbols = not (boptsLibStrip bopts || boptsExeStrip bopts)
-  menv <- getMinimalEnvOverride
+  (_targets, _mbp, _locals, _extraToBuild, sourceMap) <- loadSourceMapFull NeedTargets boptsCli
 
-  (_targets, mbp, locals, extraToBuild, sourceMap) <- loadSourceMapFull NeedTargets boptsCli
-  _stackYaml <- view stackYamlL
-
-  (installedMap, _globalDumpPkgs, _snapshotDumpPkgs, localDumpPkgs) <-
-    getInstalled menv
-                 GetInstalledOpts
-                   { getInstalledProfiling = profiling
-                   , getInstalledHaddock   = shouldHaddockDeps bopts
-                   , getInstalledSymbols   = symbols }
-                 sourceMap
-
-  baseConfigOpts <- mkBaseConfigOpts boptsCli
-  plan <- withLoadPackage $ \loadPackage ->
-    constructPlan mbp baseConfigOpts locals extraToBuild localDumpPkgs loadPackage sourceMap installedMap (boptsCLIInitialBuildSteps boptsCli)
-  let pkgs = prioritize $ planToPackages plan ++ revPkgs
+  let pkgs = prioritize $ sourceMapToPackages sourceMap ++ revPkgs
   liftIO $ hPutStrLn stderr $ "plan:\n" ++ show pkgs
 
   hackageDB <- liftIO $ loadHackageDB Nothing hSnapshot
