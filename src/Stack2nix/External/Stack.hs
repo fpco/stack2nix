@@ -153,6 +153,9 @@ globalOpts currentDir stackRoot extraIncludes extraLibs Args{..} =
          (globalConfigMonoid go)
          { configMonoidExtraIncludeDirs = extraIncludes
          , configMonoidExtraLibDirs = extraLibs
+         , configMonoidNixOpts = mempty
+             { nixMonoidEnable = First (Just True)
+             }
          }
      , globalLogLevel = if argVerbose then LevelDebug else LevelInfo
      }
