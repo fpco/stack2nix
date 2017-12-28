@@ -1,115 +1,196 @@
+{-# LANGUAGE BangPatterns      #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
 
 module Stack2nix.External.Stack
-  ( PackageRef(..), runPlan
+  ( runPlan
   ) where
 
-import           Control.Monad                 (unless)
-import           Data.List                     (isInfixOf)
+import           Data.List                     (intercalate)
+import qualified Data.HashMap.Strict           as HashMap
 import qualified Data.Map.Strict               as M
 import           Data.Maybe                    (fromJust)
 import qualified Data.Set                      as S
-import           Data.Text                     (pack, unpack)
+import           Data.Text                     (unpack)
 import           Options.Applicative
 import           Stack.Build.Source            (loadSourceMapFull)
 import           Stack.Build.Target            (NeedTargets (..))
+import           Stack.Fetch                   (withCabalLoader)
 import           Stack.Options.BuildParser
 import           Stack.Options.GlobalParser
 import           Stack.Options.Utils           (GlobalOptsContext (..))
+import           Stack.Package                 (PackageConfig (..), readPackageUnresolvedBS,
+                                                resolvePackage)
+import           Stack.PackageIndex            (getPackageCaches)
 import           Stack.Prelude                 hiding (mapConcurrently, logDebug)
 import           Stack.Runners                 (withBuildConfig)
-import           Stack.Types.BuildPlan         (Repo (..), PackageLocation (..))
+import           Stack.Types.BuildPlan         (Repo (..), PackageLocation (..), PackageLocationIndex (..))
 import           Stack.Types.Config
 import           Stack.Types.Config.Build      (BuildCommand (..))
+import           Stack.Types.FlagName          (FlagName, flagNameString)
 import           Stack.Types.Nix
 import           Stack.Types.Package           (PackageSource (..), lpPackage,
-                                                packageName,
-                                                packageVersion, lpLocation)
-import           Stack.Types.PackageName       (PackageName)
+                                                packageVersion, lpLocation,
+                                                packageFlags, packageDeps,
+                                                packageGhcOptions)
+import           Stack.Types.PackageName       (PackageName, packageNameString, parsePackageName)
 import           Stack.Types.PackageIdentifier (PackageIdentifier (..),
-                                                packageIdentifierString,
-                                                PackageIdentifierRevision (..))
-import           Stack2nix.External.Cabal2nix  (cabal2nix)
+                                                PackageIdentifierRevision (..),
+                                                StaticSHA256,
+                                                staticSHA256ToText,
+                                                CabalFileInfo (..),
+                                                showCabalHash)
+import           Stack.Types.PackageIndex      (PackageCache (PackageCache), pdSHA256)
+import           Stack.Types.Version           (Version, versionString)
 import           Stack2nix.External.Util       (failHard, runCmd)
 import           Stack2nix.Types               (Args (..))
-import           Stack2nix.Util                (mapPool, logDebug)
-import           System.Directory              (canonicalizePath,
-                                                createDirectoryIfMissing,
-                                                getCurrentDirectory,
-                                                makeRelativeToCurrentDirectory)
-import           System.FilePath               (makeRelative, (</>))
-import           System.IO                     (hPutStrLn, stderr)
-import qualified Distribution.Nixpkgs.Haskell.Hackage as DB
-import Distribution.Nixpkgs.Haskell.PackageSourceSpec (loadHackageDB)
-
-data PackageRef
-  = HackagePackage PackageIdentifierRevision
-  | NonHackagePackage PackageIdentifier (PackageLocation FilePath)
-  deriving (Eq, Show)
-
-genNixFile :: Args -> FilePath -> FilePath -> Maybe String -> Maybe String -> DB.HackageDB -> PackageRef -> IO ()
-genNixFile args baseDir outDir uri argRev hackageDB pkgRef = do
-  cwd <- getCurrentDirectory
-  logDebug args $ "\nGenerating nix expression for " ++ show pkgRef
-  logDebug args $ "genNixFile (cwd): " ++ cwd
-  logDebug args $ "genNixFile (baseDir): " ++ baseDir
-  logDebug args $ "genNixFile (outDir): " ++ outDir
-  logDebug args $ "genNixFile (uri): " ++ show uri
-  logDebug args $ "genNixFile (pkgRef): " ++ show pkgRef
-  case pkgRef of
-    HackagePackage (PackageIdentifierRevision pkg revision) -> -- FIXME use revision
-      void $ cabal2nix args ("cabal://" <> packageIdentifierString pkg) Nothing Nothing (Just outDir) hackageDB
-    NonHackagePackage _ident (PLFilePath path) -> do
-      relPath <- makeRelativeToCurrentDirectory path
-      logDebug args $ "genNixFile (LocalPackage: relPath): " ++ relPath
-      projRoot <- canonicalizePath $ cwd </> baseDir
-      logDebug args $ "genNixFile (LocalPackage: projRoot): " ++ projRoot
-      let defDir = baseDir </> makeRelative projRoot path
-      logDebug args $ "genNixFile (LocalPackage: defDir): " ++ defDir
-      unless (".s2n" `isInfixOf` path) $
-        void $ cabal2nix args(fromMaybe defDir uri) (pack <$> argRev) (const relPath <$> uri) (Just outDir) hackageDB
-    NonHackagePackage _ident (PLRepo repo) ->
-       cabal2nix args (unpack $ repoUrl repo) (Just $ repoCommit repo) (Just (repoSubdirs repo)) (Just outDir) hackageDB
-    NonHackagePackage _ident PLArchive {} -> error "genNixFile: No support for archive package locations"
-
-sourceMapToPackages :: Map PackageName PackageSource -> [PackageRef]
-sourceMapToPackages = map sourceToPackage . M.elems
-  where
-    sourceToPackage :: PackageSource -> PackageRef
-    sourceToPackage (PSIndex _ _flags _options pir) = HackagePackage pir
-    sourceToPackage (PSFiles lp _) =
-      let pkg = lpPackage lp
-          ident = PackageIdentifier (packageName pkg) (packageVersion pkg)
-       in NonHackagePackage ident (lpLocation lp)
+import           Stack2nix.Util                (logDebug)
+import           System.Directory              (createDirectoryIfMissing)
 
 planAndGenerate :: HasEnvConfig env
                 => BuildOptsCLI
-                -> FilePath
-                -> FilePath
-                -> Maybe String
-                -> Args
-                -> IO ()
+                -> (String -> IO ())
                 -> RIO env ()
-planAndGenerate boptsCli baseDir outDir remoteUri args@Args{..} doAfter = do
-    (_targets, _mbp, _locals, _extraToBuild, sourceMap) <- loadSourceMapFull NeedTargets boptsCli
+planAndGenerate boptsCli doAfter = do
+    (_targets, _mbp, _locals, _extraToBuild, sourceMap') <- loadSourceMapFull NeedTargets boptsCli
 
-    let pkgs = sourceMapToPackages sourceMap
-    liftIO $ hPutStrLn stderr $ "plan:\n" ++ show pkgs
+    if' <- parsePackageName "if"
+    let sourceMap = M.delete if' sourceMap'
 
-    hackageDB <- liftIO $ loadHackageDB Nothing argHackageSnapshot
-    void $ liftIO $ mapM_ (\pkg -> cabal2nix args ("cabal://" ++ pkg) Nothing Nothing (Just outDir) hackageDB) $ words "hscolour stringbuilder"
-    void $ liftIO $ mapPool argThreads (genNixFile args baseDir outDir remoteUri argRev hackageDB) pkgs
-    liftIO doAfter
+    res <- fmap concat $ forM (M.toList sourceMap) $ \(name, pkgSrc) -> withCabalLoader $ \loadFromIndex -> do
+      (package, source) <-
+        case pkgSrc of
+          PSFiles lp _ -> do
+            let source =
+                  case lpLocation lp of
+                    PLRepo repo -> SourceGit (repoUrl repo) (repoCommit repo) (repoSubdirs repo)
+                    PLFilePath fp -> SourceFilePath fp
+                    PLArchive _ -> error "Archives are not supported"
+            return (lpPackage lp, source)
+          PSIndex _ flags options pir -> do
+            bs <- liftIO $ loadFromIndex pir
+            (_warnings, gpd) <- readPackageUnresolvedBS (PLIndex pir) bs
+            compiler <- view actualCompilerVersionL
+            platform <- view platformL
+            (sha256, revNum) <- lookupRevision pir
+            let packageConfig = PackageConfig
+                  { packageConfigEnableTests = False
+                  , packageConfigEnableBenchmarks = False
+                  , packageConfigFlags = flags
+                  , packageConfigGhcOptions = options
+                  , packageConfigCompilerVersion = compiler
+                  , packageConfigPlatform = platform
+                  }
+                package = resolvePackage packageConfig gpd
+            return (package, SourceHackage (staticSHA256ToText <$> sha256) revNum)
+      return $ displayDecl Decl
+        { declName = name
+        , declDeps = S.fromList $ map packageNameString $ M.keys $ packageDeps package
+        , declVersion = packageVersion package
+        , declSource = source
+        , declFlags = packageFlags package
+        , declOptions = packageGhcOptions package
+        }
+
+    liftIO $ doAfter res
+
+lookupRevision :: HasConfig env => PackageIdentifierRevision -> RIO env (Maybe StaticSHA256, Int)
+lookupRevision pir@(PackageIdentifierRevision (PackageIdentifier name version) revision) = do
+  let ensure Nothing = error $ "Could not look up revision info for: " ++ show pir
+      ensure (Just x) = return x
+  PackageCache m1 <- getPackageCaches
+  m2 <- ensure $ HashMap.lookup name m1
+  (_index, mpd, revisions) <- ensure $ HashMap.lookup version m2
+  revNum <-
+    case revision of
+      CFILatest -> return $ length (toList revisions) - 1
+      CFIHash _ cabalHash ->
+        let loop _ [] = error $ "Could not find cabal hash: " ++ unpack (showCabalHash cabalHash)
+            loop !idx ((hashes, _):xs) =
+              if cabalHash `elem` hashes
+                then return idx
+                else loop (idx + 1) xs
+         in loop 0 (toList revisions)
+      CFIRevision w -> return $ fromIntegral w
+  return (pdSHA256 <$> mpd, revNum)
+
+data Decl = Decl
+  { declName :: !PackageName
+  , declDeps :: !(S.Set String)
+  , declVersion :: !Version
+  , declSource :: !Source
+  , declFlags :: !(Map FlagName Bool)
+  , declOptions :: ![Text]
+  }
+
+data Source
+  = SourceHackage
+      !(Maybe Text) -- sha256 of tarball, Maybe due to hackage-security bug
+      !Int -- revision number
+  | SourceGit
+      !Text -- URL
+      !Text -- commit
+      !FilePath -- subdir
+  | SourceFilePath !FilePath
+
+displayDecl :: Decl -> String
+displayDecl Decl {..} = unlines $ map ("  " ++) $ lines $ concat
+  [ packageNameString declName
+  , " = callPackage ({"
+  , intercalate ", "
+      $ S.toList
+      $ S.fromList (words "fetchgit mkDerivation stdenv") <> declDeps
+  , " }:\nmkDerivation {\n  pname = \""
+  , packageNameString declName
+  , "\";\n  version = \""
+  , versionString declVersion
+  , "\";\n"
+  , "  license = stdenv.lib.licenses.bsd3;\n" -- FIXME get the real info
+  , case declSource of
+      SourceHackage msha256 rev -> concat
+        [ case msha256 of
+            Nothing -> ""
+            Just sha256 -> concat
+              [ "  sha256 = "
+              , show sha256
+              , ";\n"
+              ]
+        , "  revision = \""
+        , show rev
+        , "\";\n"
+        ]
+      SourceGit url commit _subdir -> concat -- FIXME use subdir
+        [ "  src = fetchgit {\n    url = "
+        , show url
+        , ";\n    rev = "
+        , show commit
+        , ";\n  };\n"
+        ]
+      SourceFilePath fp -> concat
+        [ "  src = ./"
+        , fp
+        , ";\n"
+        ]
+  , "  configureFlags = [\""
+  , concatMap (\(name, active) -> concat
+      [ "-f"
+      , if active then "" else "-"
+      , flagNameString name
+      ]) (M.toList declFlags) -- FIXME declOptions
+  , "\"];\n"
+  , "  libraryHaskellDepends = [\n"
+  , concatMap (\p -> "    " ++ p ++ "\n") (S.toList declDeps)
+  , "  ];\n  executableHaskellDepends = [\n"
+  , concatMap (\p -> "    " ++ p ++ "\n") (S.toList declDeps)
+  , "  ];\n  doHaddock = false;\n  doCheck = false;\n}) {};\n"
+  ]
 
 runPlan :: FilePath
-        -> FilePath
-        -> Maybe String
         -> LoadConfig
         -> Args
+        -> (String -> IO ())
         -> IO ()
-        -> IO ()
-runPlan baseDir outDir remoteUri lc args@Args{..} doAfter = do
+runPlan baseDir lc args@Args{..} doAfter = do
   let pkgsInConfig = nixPackages (configNix $ lcConfig lc)
   let pkgs = map unpack pkgsInConfig ++ ["ghc", "git"]
   let stackRoot = "/tmp/s2n"
@@ -119,7 +200,7 @@ runPlan baseDir outDir remoteUri lc args@Args{..} doAfter = do
              pure $ globalOpts baseDir stackRoot includes libs args
   logDebug args $ "stack global opts:\n" ++ show globals
   logDebug args $ "stack build opts:\n" ++ show buildOpts
-  withBuildConfig globals $ planAndGenerate buildOpts baseDir outDir remoteUri args doAfter
+  withBuildConfig globals $ planAndGenerate buildOpts doAfter
 
 {-
   TODO:

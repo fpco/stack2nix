@@ -25,3 +25,6 @@ nix:
   packages: [zlib,gmp,git,pcre,openssl]
 
 extra-package-dbs: []
+
+extra-include-dirs: [/usr/local/opt/openssl/include/]
+extra-lib-dirs: [/usr/local/opt/openssl/lib/]
